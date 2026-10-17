@@ -1,0 +1,49 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: bmc
+      POSTGRES_USER: bmc
+      POSTGRES_PASSWORD: bmc
+    ports: ["5432:5432"]
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bmc -d bmc"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+  api:
+    build: ./backend
+    env_file: .env
+    environment:
+      GEOAPIFY_API_KEY: ${GEOAPIFY_API_KEY}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      CITIZEN_FRONTEND_URL: ${CITIZEN_FRONTEND_URL:-http://localhost:5174}
+    ports: ["8000:8000"]
+    volumes:
+      - "./artifacts:/artifacts:ro"
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_started }
+  worker:
+    build: ./backend
+    command: celery -A app.worker.celery_app worker --loglevel=info
+    env_file: .env
+    volumes:
+      - "./artifacts:/artifacts:ro"
+    depends_on: [api, redis]
+  frontend:
+    build: ./frontend
+    ports: ["5173:80"]
+    depends_on: [api]
+  citizen-frontend:
+    build: ./citizen-frontend
+    ports: ["5174:5174"]
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    depends_on: [api]
+volumes:
+  postgres_data:

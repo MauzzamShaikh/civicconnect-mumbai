@@ -1,0 +1,14 @@
+sentence-transformers==3.3.1
+# Keep the Hugging Face model-loading stack compatible with sentence-transformers
+# 3.3.1 and the CPU PyTorch 2.5.1 image. These must not float on rebuilds.
+transformers==4.46.3
+huggingface-hub==0.26.5
+tokenizers==0.20.3
+safetensors==0.4.5
+accelerate==1.1.1
+scikit-learn==1.8.0
+joblib==1.4.2
+pillow==11.0.0
+numpy==2.1.3
+opencv-python-headless==4.10.0.84
+faster-whisper==1.1.1

@@ -1,0 +1,12 @@
+
+tmp/
+temp/
+
+# Ignore model formats by default
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Keep the required BMC photo-classification model
+!model2_photo_classifier_v2.pth

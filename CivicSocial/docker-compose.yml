@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: civicsocial
+      POSTGRES_USER: civicsocial
+      POSTGRES_PASSWORD: civicsocial
+    ports: ["5433:5432"]
+    volumes: [civicsocial_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U civicsocial -d civicsocial"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  api:
+    build: ./backend
+    env_file: .env
+    ports: ["8001:8001"]
+    depends_on:
+      db: { condition: service_healthy }
+  frontend:
+    build: ./frontend
+    ports: ["5180:80"]
+    depends_on: [api]
+volumes:
+  civicsocial_data:

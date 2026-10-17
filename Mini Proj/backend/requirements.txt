@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+sqlalchemy==2.0.36
+psycopg[binary]==3.2.3
+celery==5.4.0
+redis==5.2.1
+python-multipart==0.0.20
+langdetect==1.0.9
+requests==2.32.3
+groq
+PyJWT==2.10.1
+pwdlib[argon2]==0.2.1
