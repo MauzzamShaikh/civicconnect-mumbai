@@ -81,14 +81,14 @@ function formatTime(isoStr) {
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
   if (diff < 86400 * 7) return `${Math.floor(diff / 86400)}d ago`;
-  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  return d.toLocaleDateString('en-IN', { month: 'short', day: 'numeric', timeZone: 'Asia/Kolkata' });
 }
 
 function formatFullTime(isoStr) {
   if (!isoStr) return '';
-  return new Date(isoStr).toLocaleString('en-US', {
+  return new Date(isoStr).toLocaleString('en-IN', {
     hour: 'numeric', minute: '2-digit',
-    month: 'short', day: 'numeric', year: 'numeric'
+    month: 'short', day: 'numeric', year: 'numeric', timeZone: 'Asia/Kolkata'
   });
 }
 
@@ -969,7 +969,7 @@ function sendMessage(convoId) {
   input.value = '';
 
   const now = new Date();
-  const timeStr = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  const timeStr = now.toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit', timeZone: 'Asia/Kolkata' });
   const msgEl = document.createElement('div');
   msgEl.innerHTML = renderMessage({ mine: true, text, time: timeStr });
   const messages = document.getElementById('chat-messages');
@@ -1069,7 +1069,7 @@ async function renderProfile(container, handle) {
       <div class="profile-meta-row">
         <div class="profile-meta-item">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="18" rx="2" stroke="currentColor" stroke-width="2"/><path d="M16 2v4M8 2v4M3 10h18" stroke="currentColor" stroke-width="2"/></svg>
-          Joined ${u.created_at ? new Date(u.created_at).toLocaleDateString(undefined, { month: 'long', year: 'numeric' }) : 'recently'}
+          Joined ${u.created_at ? new Date(u.created_at).toLocaleDateString('en-IN', { month: 'long', year: 'numeric', timeZone: 'Asia/Kolkata' }) : 'recently'}
         </div>
       </div>
       <div class="profile-stats">
@@ -1764,7 +1764,17 @@ async function submitPost() {
     }
     closeCompose();
     refreshNotifBadge();
-    if (created.integration && created.integration.state !== 'acknowledged') {
+    if (created.integration?.state === 'not_civic') {
+      toast('Post published. It was not forwarded to BMC because it was not classified as an actionable civic complaint.', 6000);
+    } else if (created.integration?.state === 'uncertain') {
+      toast('Post published. Civic issue detection was uncertain, so it was not sent to BMC. Please clarify the issue in a follow-up post.', 7000);
+    } else if (created.integration?.state === 'classification_retry') {
+      toast('Post published. Civic issue detection is temporarily unavailable; BMC forwarding will retry automatically.', 7000);
+    } else if (['pending', 'sending', 'queued'].includes(created.integration?.state)) {
+      toast('Post published. BMC forwarding is queued and will continue in the background.', 7000);
+    } else if (created.integration?.state === 'delivery_state_unavailable') {
+      toast('Post published, but BMC delivery status could not be saved. Your post remains on CivicSocial.', 7000);
+    } else if (created.integration && created.integration.state !== 'acknowledged') {
       toast(`Post published. BMC delivery ${created.integration.state}: ${created.integration.error || 'it will retry automatically; check the delivery status later.'}`, 6000);
     } else if (created.integration?.complaint_reference) {
       toast(`Post published and registered with BMC: ${created.integration.complaint_reference}`);

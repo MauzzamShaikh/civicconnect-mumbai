@@ -4,16 +4,17 @@ TE-B Mini Project · Group 6. This project integrates the supplied models; it do
 
 ## Run locally
 
-1. Ensure Docker Desktop is running and place the supplied CSV, joblib file, and `.pth` file in `./artifacts/`. Compose mounts that folder read-only at `/artifacts`.
+1. Ensure Docker Desktop is running. Place the model `.joblib` and `.pth` artifacts in `./artifacts/`; the private complaint CSV is optional and is intentionally not committed. Compose mounts the folder read-only at `/artifacts`.
 2. Run `docker-compose up --build`.
 3. Open the dashboard at `http://localhost:5173`; interactive API docs are at `http://localhost:8000/docs`.
 
-On its first startup, the API downloads the required `paraphrase-multilingual-MiniLM-L12-v2` embedding model and encodes the 462 seed records in the same space used by Model 1. That startup can take longer than the live demo path. Seeding happens only if the database is empty.
+The checked-in `.env.example` defaults to `SEED_ON_STARTUP=false`, so a fresh clone can start without the private complaint dataset and does not seed an empty database. To opt into the existing demo import, obtain permission to use `artifacts/BMC_Complaints_FINAL_v4.csv`, copy it into the read-only artifacts directory, and set `SEED_ON_STARTUP=true` in your local `.env`. When enabled on an empty database, the API downloads the required `paraphrase-multilingual-MiniLM-L12-v2` embedding model and encodes the dataset. Existing populated databases are left unchanged by the seed routine.
 
 ## API
 
 - `POST /complaints` accepts text, optional coordinates, and optional base64 photo. It detects display language, assigns an incremental centroid cluster at cosine threshold `.75`, runs the existing classifiers, fuses severity at 45% text/55% photo, persists it, and reranks the cluster inline for the live demonstration.
 - `GET /clusters` and `GET /clusters/{cluster_id}` provide the map and explainability data.
+- `GET /map-approximations` is staff-only and returns labelled ward-centre or between-place estimate markers separately from verified cluster centroids. Legacy coordinates with an unknown source remain visible in the complaint register as unresolved.
 - `GET /complaints?ward=&category=&status=` filters dashboard records.
 - `PATCH /complaints/{id}/status` lets authorized BMC staff move complaints through Open and In Progress and mark them Resolved directly. Each successful transition records status history and notifies the complaint owner.
 - `POST /integrations/civicsocial/complaints` accepts a CivicSocial post and optional validated media into Pending Review. Configure the BMC-only `CIVICSOCIAL_INTEGRATION_SECRET` in the root `.env` file and send it as `Authorization: Bearer <secret>` from the future service adapter. Keep the value private; it is read only by the backend. Leave it unset to disable the integration. The endpoint is idempotent by source platform and original post ID.

@@ -54,7 +54,7 @@ def seed():
                 image_url = row.get("image_url")
                 lat, lng = ward_coord(row.get("ward_code"))
                 complaint = Complaint(
-                    id=row["ID"], text=seed_text, language=row.get("language"), ward_code=row.get("ward_code"), ward_area=row.get("ward_area"), location=seed_location or None,
+                    id=row["ID"], text=seed_text, language=row.get("language"), ward_code=row.get("ward_code"), ward_area=row.get("ward_area"), location=seed_location or None, location_source="ward_approximate" if lat is not None and lng is not None else "none",
                     category=row.get("main_category"), sub_issue=row.get("sub_issue"), official_sla_days=f(row.get("official_sla_days")), has_media=row.get("has_media", "").lower() == "yes",
                     image_url=image_url, image_data=fetch_image_data(image_url), is_real=row.get("is_real", "").lower() == "yes", cluster_id=int(f(row.get("cluster_id")) or -1),
                     embedding=model.embedding(cluster_text).tolist(), text_severity=severity_bucket(text_score), final_severity=severity_bucket(score), final_score=score,

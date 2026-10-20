@@ -87,7 +87,7 @@ class Complaint(Base):
     status: Mapped[str] = mapped_column(String(40), default="open")
     lat: Mapped[float | None] = mapped_column(Float)
     lng: Mapped[float | None] = mapped_column(Float)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class ComplaintStatusHistory(Base):

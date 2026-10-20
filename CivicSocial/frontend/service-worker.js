@@ -1,4 +1,4 @@
-const CACHE = 'civicsocial-shell-v4';
+const CACHE = 'civicsocial-shell-v5';
 const SHELL = ['./', './index.html', './styles.css', './app.js', './post-submission.mjs', './manifest.webmanifest', './icon.svg'];
 const API_PATHS = ['/api', '/auth', '/users', '/posts', '/notifications', '/health'];
 

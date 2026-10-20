@@ -13,3 +13,11 @@ test("rebuilt CivicSocial serves the imported submission module as JavaScript", 
   assert.match(source, /export function createSubmissionController/);
   assert.match(source, /finally\s*\{/);
 });
+
+test("missing JavaScript modules are not masked by the SPA fallback", {
+  skip: !baseUrl && "Set CIVICSOCIAL_FRONTEND_URL to run the live frontend check",
+}, async () => {
+  const response = await fetch(new URL("/missing-post-submission.mjs", baseUrl));
+  assert.equal(response.status, 404, "missing modules must not return the SPA index");
+  assert.doesNotMatch(await response.text(), /id=["']app-shell["']/i, "missing modules must not return the app shell");
+});

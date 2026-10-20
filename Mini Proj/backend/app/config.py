@@ -14,6 +14,6 @@ SAME_LOCATION_RADIUS_KM = float(os.getenv("SAME_LOCATION_RADIUS_KM", "0.75"))
 SAME_LOCATION_SEMANTIC_THRESHOLD = float(
     os.getenv("SAME_LOCATION_SEMANTIC_THRESHOLD", "0.55")
 )
-SEED_ON_STARTUP = os.getenv("SEED_ON_STARTUP", "true").lower() == "true"
+SEED_ON_STARTUP = os.getenv("SEED_ON_STARTUP", "false").lower() == "true"
 SYNC_LIVE_DEMO = os.getenv("SYNC_LIVE_DEMO", "true").lower() == "true"
 EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"

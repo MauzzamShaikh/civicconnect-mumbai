@@ -113,6 +113,10 @@ app.post("/posts", requireAuth, asyncRoute(async (req, res) => {
     complaint_reference: integration.complaintReference || null,
     error: integration.lastError || null,
     media_warning: integration.mediaWarning || null,
+    classification: integration.classification || null,
+    classification_status: integration.classificationStatus || "completed",
+    category: integration.category || "unknown",
+    reason: integration.reason || null,
   } } : post);
 }));
 

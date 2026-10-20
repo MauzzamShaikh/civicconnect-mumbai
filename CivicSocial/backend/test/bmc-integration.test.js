@@ -11,19 +11,22 @@ const Op = { in: Symbol.for("in"), or: Symbol.for("or"), lte: Symbol.for("lte") 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "../..");
 
-function harness({ fetchResponses = [], official = true, ackFailsAfterCreate = false, fetchDelay = 0, configOverrides = {} } = {}) {
+function harness({ fetchResponses = [], official = true, ackFailsAfterCreate = false, fetchDelay = 0, configOverrides = {}, postText, postId = 317, createdAt, classification = { classification: "civic_complaint", category: "Roads", reason: "Actionable road defect" }, classificationError = null } = {}) {
   let clock = new Date("2026-10-14T00:00:00.000Z");
   let recordId = 0;
   let replyId = 1000;
   let ackAttempts = 0;
   const rows = new Map();
   const calls = [];
+  const classificationCalls = [];
   const replies = [];
   const logs = [];
+  let currentClassification = classification;
+  let currentClassificationError = classificationError;
   const originalPost = {
-    id: 317,
+    id: postId,
     authorId: 7,
-    text: "@mybmc Please repair the pothole outside the school.",
+    text: postText || "@mybmc Please repair the pothole outside the school.",
     imageData: null,
     videoData: null,
     parentPostId: null,
@@ -37,6 +40,7 @@ function harness({ fetchResponses = [], official = true, ackFailsAfterCreate = f
     parent_post_id: originalPost.parentPostId,
     author: { id: 7, handle: "neighbor", is_official: false },
   };
+  if (createdAt) publicPost.created_at = createdAt;
   let officialUser = official === false ? null : { id: 1, handle: "mybmc", isOfficial: official !== "unofficial" };
   const User = {
     async findOne({ where }) { return where.handle === "mybmc" ? officialUser : null; },
@@ -100,12 +104,21 @@ function harness({ fetchResponses = [], official = true, ackFailsAfterCreate = f
       if (next instanceof Error) throw next;
       return { ok: next.status >= 200 && next.status < 300, status: next.status, async json() { return next.body; } };
     },
+    classifyCivicPost: async (text) => {
+      classificationCalls.push(text);
+      if (currentClassificationError) throw currentClassificationError;
+      return typeof currentClassification === "function"
+        ? currentClassification(text, classificationCalls.length)
+        : currentClassification;
+    },
     now: () => new Date(clock),
     logger: { error(message) { logs.push(message); }, warn(message) { logs.push(message); }, info(message) { logs.push(message); } },
   });
   return {
-    integration, calls, replies, rows, logs, publicPost, originalPost,
+    integration, calls, classificationCalls, replies, rows, logs, publicPost, originalPost,
     setClock(value) { clock = new Date(value); },
+    setClassification(value) { currentClassification = value; currentClassificationError = null; },
+    setClassificationError(value) { currentClassificationError = value; },
     get ackAttempts() { return ackAttempts; },
     setOfficial(value) { officialUser = value ? { id: 1, handle: "mybmc", isOfficial: true } : null; },
   };
@@ -177,6 +190,131 @@ test("eligible post uses stable ID, canonical link, and bearer authentication", 
   assert.equal(h.replies[0].text.includes("CMP-1234567890"), true);
   assert.equal(h.replies[0].text.includes("http://localhost:5174/track?reference=CMP-1234567890"), true);
   assert.match(h.replies[0].text, /http:\/\/localhost:5174\/track\?reference=CMP-1234567890/);
+  assert.equal(h.classificationCalls.length, 1);
+});
+
+test("traffic signal and illegal hawking examples are classified by AI then forwarded exactly once", async () => {
+  for (const [text, category] of [
+    ["@mybmc Traffic light is not working at JJ signal", "Transport and mobility"],
+    ["@mybmc Illegal hawkers present at CSMT station", "Encroachment"],
+  ]) {
+    const h = harness({ postText: text, classification: {
+      classification: "civic_complaint", category, reason: "Actionable public-space issue",
+    } });
+    const result = await h.integration.processPost(h.publicPost);
+    const duplicate = await h.integration.processPost(h.publicPost);
+    assert.equal(result.status, "acknowledged", text);
+    assert.equal(result.classification, "civic_complaint", text);
+    assert.equal(result.category, category, text);
+    assert.equal(h.calls.length, 1, text);
+    assert.equal(duplicate.complaintReference, result.complaintReference, text);
+  }
+});
+
+test("clear Hindi signal and garbage complaints still forward when Groq misses their meaning", async () => {
+  const cases = [
+    ["@mybmc सैफी अस्पताल के बाहर ट्रैफिक सिग्नल काम नहीं कर रहा है, जिससे ट्रैफिक जाम लग गया है।", "Transport and mobility"],
+    ["@mybmc गिरगांव चौपाटी की हालत देखिए, यह कचरे से भरी हुई है। कृपया इस मामले पर तुरंत ध्यान दें।", "Solid Waste Management (SWM)"],
+  ];
+  for (const [index, [text, category]] of cases.entries()) {
+    const h = harness({
+      postId: 600 + index,
+      postText: text,
+      classification: { classification: "not_civic_complaint", category: "unknown", reason: "Mocked Groq false negative" },
+    });
+    const result = await h.integration.processPost(h.publicPost);
+    assert.equal(result.status, "acknowledged", text);
+    assert.equal(result.classification, "civic_complaint", text);
+    assert.equal(result.category, category, text);
+    assert.equal(h.calls.length, 1, text);
+    assert.equal(h.calls[0].headers["idempotency-key"], String(600 + index));
+  }
+});
+
+test("repeated clear complaint text on distinct posts gets one BMC delivery per post ID", async () => {
+  const text = "@mybmc सैफी अस्पताल के बाहर ट्रैफिक सिग्नल काम नहीं कर रहा है, जिससे ट्रैफिक जाम लग गया है।";
+  const deliveries = [];
+  for (const postId of [701, 702, 703, 704, 705]) {
+    const h = harness({
+      postId,
+      postText: text,
+      classification: { classification: "uncertain", category: "unknown", reason: "Mocked Groq uncertain result" },
+    });
+    const result = await h.integration.processPost(h.publicPost);
+    assert.equal(result.status, "acknowledged");
+    assert.equal(h.calls.length, 1);
+    deliveries.push(h.calls[0].headers["idempotency-key"]);
+  }
+  assert.deepEqual(deliveries, ["701", "702", "703", "704", "705"]);
+});
+
+test("uncollected garbage and illegal hawkers outside stations override a Groq false negative", async () => {
+  const cases = [
+    ["@mybmc The garbage outside ghatkopar station has not been collected from 2 days", "Solid Waste Management (SWM)"],
+    ["@mybmc There is a lot of illegal hawkers outside masjid railway station", "Encroachment"],
+  ];
+  for (const [index, [text, category]] of cases.entries()) {
+    const h = harness({
+      postId: 800 + index,
+      postText: text,
+      classification: { classification: "not_civic_complaint", category: "unknown", reason: "Mocked Groq false negative" },
+    });
+    const result = await h.integration.processPost(h.publicPost);
+    assert.equal(result.status, "acknowledged", text);
+    assert.equal(result.classification, "civic_complaint", text);
+    assert.equal(result.category, category, text);
+    assert.equal(h.calls.length, 1, text);
+  }
+});
+
+test("non-civic and uncertain @mybmc posts publish without BMC forwarding", async () => {
+  for (const classification of ["not_civic_complaint", "uncertain"]) {
+    const h = harness({ classification: {
+      classification, category: "unknown", reason: "No clearly actionable municipal issue was identified",
+    } });
+    const result = await h.integration.processPost(h.publicPost);
+    assert.equal(result.status, classification === "uncertain" ? "uncertain" : "not_civic");
+    assert.equal(result.classification, classification);
+    assert.equal(h.calls.length, 0);
+    assert.equal(h.rows.size, 1);
+  }
+});
+
+test("ordinary posts do not call Groq or create a BMC delivery row", async () => {
+  const h = harness();
+  const ordinary = { ...h.publicPost, text: "A neighborhood update without an account mention" };
+  assert.equal(await h.integration.processPost(ordinary), null);
+  assert.equal(h.classificationCalls.length, 0);
+  assert.equal(h.rows.size, 0);
+  assert.equal(h.calls.length, 0);
+});
+
+test("classification failures persist a retry and later forward with the same idempotency key", async () => {
+  const h = harness({ classificationError: new Error("Groq civic classification timed out") });
+  const pending = await h.integration.processPost(h.publicPost);
+  assert.equal(pending.status, "classification_retry");
+  assert.equal(pending.classificationStatus, "unavailable");
+  assert.equal(h.calls.length, 0);
+  assert.ok(h.logs.some(message => message.includes("BMC_DELIVERY_START post=317")));
+  assert.ok(h.logs.some(message => message.includes("BMC_DELIVERY_OUTCOME post=317 status=classification_retry")));
+
+  h.setClassification({ classification: "civic_complaint", category: "Roads", reason: "Actionable pothole" });
+  h.setClock("2026-10-14T00:00:31.000Z");
+  await h.integration.processPending();
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.calls[0].headers["idempotency-key"], String(h.publicPost.id));
+});
+
+test("Groq API keys are redacted from classification delivery errors and logs", async () => {
+  const key = "private-groq-test-key";
+  const h = harness({
+    configOverrides: { groqApiKey: key },
+    classificationError: new Error(`provider error echoed ${key}`),
+  });
+  const result = await h.integration.processPost(h.publicPost);
+  assert.equal(result.status, "classification_retry");
+  assert.doesNotMatch(JSON.stringify(result), new RegExp(key));
+  assert.ok(h.logs.every(message => !message.includes(key)));
 });
 
 test("supported image and video data URLs are forwarded; unsupported formats are omitted", async () => {
@@ -288,6 +426,21 @@ test("duplicate delivery calls and concurrent requests send only once and acknow
   ]);
   assert.equal(concurrent.calls.length, 1);
   assert.equal(concurrent.replies.length, 1);
+});
+
+test("reused numeric post IDs with a new creation time receive a fresh outbox and BMC identity", async () => {
+  const h = harness({ postId: 42, createdAt: "2026-10-18T10:00:00.000Z" });
+  const first = await h.integration.processPost(h.publicPost);
+  const secondPost = { ...h.publicPost, created_at: "2026-10-18T10:01:00.000Z" };
+  const second = await h.integration.processPost(secondPost);
+
+  assert.equal(first.status, "acknowledged");
+  assert.equal(second.status, "acknowledged");
+  assert.equal(h.rows.size, 2);
+  assert.equal(h.calls.length, 2);
+  assert.notEqual(h.calls[0].headers["idempotency-key"], h.calls[1].headers["idempotency-key"]);
+  assert.ok(h.calls.every(call => call.body.original_post_id.length <= 32));
+  assert.ok(h.calls.every(call => call.body.source_post_url.endsWith("#post/42")));
 });
 
 test("missing official account retains registration and waits for safe provisioning", async () => {

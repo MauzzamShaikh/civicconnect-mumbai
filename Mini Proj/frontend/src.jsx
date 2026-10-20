@@ -13,6 +13,9 @@ import "./style.css";
 
 const api = "/api";
 const tone = { Low: "#22a06b", Medium: "#e7a221", High: "#dc4141" };
+const formatIndiaDateTime = (value) => value ? new Intl.DateTimeFormat("en-IN", {
+  timeZone: "Asia/Kolkata", dateStyle: "medium", timeStyle: "short",
+}).format(new Date(value)) : "";
 const nextStaffStatuses = {
   open: ["inspection_scheduled", "contractor_allotted", "in_progress", "resolved"],
   inspection_scheduled: ["open", "contractor_allotted", "in_progress", "resolved"],
@@ -45,6 +48,7 @@ function MapResizeObserver() {
 
 function App() {
   const [clusters, setClusters] = useState([]);
+  const [approximateLocations, setApproximateLocations] = useState([]);
   const [selected, setSelected] = useState(null);
   const [clusterDetail, setClusterDetail] = useState(null);
   const [text, setText] = useState("");
@@ -63,6 +67,7 @@ function App() {
   const [registerFilters, setRegisterFilters] = useState({ q: "", status: "", category: "", severity: "" });
   const [registerLoading, setRegisterLoading] = useState(false);
   const [statusBusy, setStatusBusy] = useState({});
+  const [locationRetryBusy, setLocationRetryBusy] = useState({});
   const [registerError, setRegisterError] = useState("");
   const [noticeData, setNoticeData] = useState({ items: [], unread_count: 0 });
   const [noticeLoading, setNoticeLoading] = useState(false);
@@ -97,6 +102,7 @@ function App() {
     setAuthStatus("signed-out");
     setStaffPassword("");
     setClusters([]);
+    setApproximateLocations([]);
     setSelected(null);
     setClusterDetail(null);
     setEvidenceByComplaint({});
@@ -136,10 +142,16 @@ function App() {
   };
 
   const reload = async () => {
-    const response = await staffFetch("/clusters");
-    if (!response.ok) throw new Error("Could not refresh the map.");
-    const nextClusters = await response.json();
+    const [response, approximateResponse] = await Promise.all([
+      staffFetch("/clusters"),
+      staffFetch("/map-approximations"),
+    ]);
+    if (!response.ok || !approximateResponse.ok) throw new Error("Could not refresh the map.");
+    const [nextClusters, nextApproximations] = await Promise.all([
+      response.json(), approximateResponse.json(),
+    ]);
     setClusters(nextClusters);
+    setApproximateLocations(nextApproximations);
     return nextClusters;
   };
   const loadOverviewStats = async () => {
@@ -442,6 +454,26 @@ function App() {
     }
   };
 
+  const retryComplaintLocation = async (complaint) => {
+    setLocationRetryBusy((current) => ({ ...current, [complaint.id]: true }));
+    setMessage({ type: "info", text: "Retrying location lookup…" });
+    try {
+      const response = await staffFetch(`/bmc/complaints/${encodeURIComponent(complaint.id)}/resolve-location`, { method: "POST" });
+      const data = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(data?.detail || "Could not retry this location lookup.");
+      await loadRegister();
+      await reload();
+      const message = data?.location_retry === "resolved"
+        ? `Verified location saved for ${complaint.id}; its cluster and map are refreshed.`
+        : `No verified location was found for ${complaint.id}; it remains unclustered.`;
+      setMessage({ type: "info", text: message });
+    } catch (error) {
+      if (error.status !== 401 && error.status !== 403) setMessage({ type: "error", text: error.message });
+    } finally {
+      setLocationRetryBusy((current) => ({ ...current, [complaint.id]: false }));
+    }
+  };
+
   const loadClusterDetails = async (clusterId) => {
     const response = await staffFetch(`/clusters/${clusterId}`);
     if (!response.ok) throw new Error("Could not load the cluster reports.");
@@ -462,6 +494,12 @@ function App() {
         body: JSON.stringify({ email: staffEmail, password: staffPassword }),
       });
       const result = await response.json().catch(() => null);
+      if (response.status >= 500) {
+        throw new Error("The portal server is starting or temporarily unavailable. Your credentials were not checked; please try again shortly.");
+      }
+      if (response.status === 429) {
+        throw new Error("Too many sign-in attempts. Please wait a few minutes and try again.");
+      }
       if (!response.ok || !result?.access_token) {
         throw new Error("Sign-in failed. Check your staff email and password.");
       }
@@ -526,7 +564,7 @@ function App() {
           {notificationPreviewOpen && <div className="staff-notice-popover" role="region" aria-label="Notification preview">
             <div className="staff-notice-heading"><strong>Recent activity</strong><button type="button" className="bmc-preview-refresh" disabled={noticeLoading} onClick={refreshNotifications}>{noticeLoading ? "Refreshing…" : "Refresh"}</button></div>
             {noticeError && <p className="error" role="alert">{noticeError}</p>}
-            {noticeData.items.length ? noticeData.items.slice(0, 5).map((notice) => <button className={`staff-notice-item ${notice.read ? "" : "unread"}`} key={notice.id} onClick={() => markNotice(notice)}><b>{!notice.read && <span className="bmc-unread-dot" aria-label="Unread" />} {notice.title}</b><span>{notice.summary}</span><small>{notice.created_at ? new Date(notice.created_at).toLocaleString() : ""}</small></button>) : <p>{noticeLoading ? "Loading notifications…" : "No notifications yet."}</p>}
+            {noticeData.items.length ? noticeData.items.slice(0, 5).map((notice) => <button className={`staff-notice-item ${notice.read ? "" : "unread"}`} key={notice.id} onClick={() => markNotice(notice)}><b>{!notice.read && <span className="bmc-unread-dot" aria-label="Unread" />} {notice.title}</b><span>{notice.summary}</span><small>{formatIndiaDateTime(notice.created_at)}</small></button>) : <p>{noticeLoading ? "Loading notifications…" : "No notifications yet."}</p>}
             <div className="bmc-header-notice-footer"><span>{overviewStats.pending_review || 0} pending review</span><a href="/notifications" onClick={(event) => { event.preventDefault(); changePage("notifications"); }}>View all notifications</a></div>
           </div>}
         </div>
@@ -664,7 +702,7 @@ function App() {
           <div className="staff-register-heading"><div><h2 id="notification-history-title">Recent activity</h2><p>{noticeData.unread_count} unread notification{noticeData.unread_count === 1 ? "" : "s"}</p></div><div className="bmc-notification-actions"><button className="bmc-secondary-button" type="button" onClick={refreshNotifications} disabled={noticeLoading}>{noticeLoading ? "Refreshing…" : "Refresh notifications"}</button><button className="bmc-secondary-button" type="button" onClick={setAllNoticesRead} disabled={!noticeData.unread_count}>Mark all as read</button></div></div>
           {noticeError && <p className="error" role="alert">{noticeError}</p>}
           {noticeData.items.length ? noticeData.items.map((notice) => <article className={`bmc-notification-history-item ${notice.read ? "" : "unread"}`} key={notice.id}>
-            <div><strong>{!notice.read && <span className="bmc-unread-dot" aria-label="Unread" />} {notice.title}</strong><p>{notice.summary}</p><small>{notice.created_at ? new Date(notice.created_at).toLocaleString() : ""}</small></div>
+            <div><strong>{!notice.read && <span className="bmc-unread-dot" aria-label="Unread" />} {notice.title}</strong><p>{notice.summary}</p><small>{formatIndiaDateTime(notice.created_at)}</small></div>
             {!notice.read ? <button className="bmc-secondary-button" type="button" onClick={() => setNoticeRead(notice)}>Mark as read</button> : <span className="bmc-notification-read-state">Read</span>}
           </article>) : <p className="staff-register-empty">{noticeLoading ? "Loading notifications…" : "No notifications yet."}</p>}
         </section>
@@ -676,7 +714,7 @@ function App() {
               const evidence = reviewMedia[item.id];
               const hasEvidence = item.has_media || item.has_video || item.has_uploaded_photo || item.has_image;
               return <article className="review-card" id={`review-${item.id}`} key={item.id}>
-                <div className="review-copy"><strong>{item.id}</strong><span className={`staff-severity staff-severity-${(item.severity || "").toLowerCase()}`}>{item.severity || "Severity unavailable"}</span><p>{item.text}</p><small>{item.source === "citizen" ? "Citizen Portal" : item.source} · {item.created_at ? new Date(item.created_at).toLocaleString() : ""}</small><small>{[item.category, item.ward ? `Ward ${item.ward}` : null, item.location].filter(Boolean).join(" · ") || "Location unavailable"}</small></div>
+                <div className="review-copy"><strong>{item.id}</strong><span className={`staff-severity staff-severity-${(item.severity || "").toLowerCase()}`}>{item.severity || "Severity unavailable"}</span><p>{item.text}</p><small>{item.source === "citizen" ? "Citizen Portal" : item.source} · {formatIndiaDateTime(item.created_at)}</small><small>{[item.category, item.ward ? `Ward ${item.ward}` : null, item.location].filter(Boolean).join(" · ") || "Location unavailable"}{item.location_confidence === "approximate" ? " · Approximate location" : item.location_confidence === "unknown" ? " · Location unresolved (confidence unknown)" : ""}</small></div>
                 <div className="review-evidence">{evidence?.uploaded_photo_data && <img src={evidence.uploaded_photo_data} alt="Original uploaded complaint photo" />}{evidence?.video_data && <video controls preload="metadata" playsInline src={evidence.video_data}>Video playback is not supported.</video>}{!hasEvidence && <p>No original media was supplied.</p>}{evidence?.loaded && !evidence.uploaded_photo_data && !evidence.video_data && <p>No original media was returned.</p>}{evidence?.error && <p role="alert">{evidence.error}</p>}{hasEvidence && <button className="bmc-secondary-button" type="button" disabled={evidence?.loading || evidenceBusyCount >= 2} onClick={() => loadReviewEvidence(item.id)}>{evidence?.loading ? "Loading evidence…" : evidence?.error ? "Retry evidence" : evidence?.loaded ? "Reload evidence" : "Load original evidence"}</button>}</div>
                 <div className="review-actions"><button type="button" disabled={reviewBusy[item.id]} onClick={() => decideReview(item, "accept")}>{reviewBusy[item.id] ? "Saving…" : "Accept"}</button><button className="bmc-danger-button" type="button" disabled={reviewBusy[item.id]} onClick={() => decideReview(item, "reject")}>Reject</button></div>
               </article>;
@@ -696,6 +734,9 @@ function App() {
 
       <section className={`bmc-map-layout ${pageView === "register" ? "is-register-view" : "is-overview-view"}`} aria-label={pageView === "register" ? "Complaint registration and map" : "Complaint map"}>
         <div className="map" id="complaint-map">
+          <div className="map-confidence-legend" role="note">
+            Verified clusters · dashed gray markers are approximate and excluded from clustering.
+          </div>
           <MapContainer center={[19.076, 72.878]} zoom={11}>
             <MapResizeObserver />
             <TileLayer
@@ -716,6 +757,21 @@ function App() {
                 <Tooltip direction="top" sticky>
                   Cluster {cluster.cluster_id} · {cluster.size} active reports
                 </Tooltip>
+              </CircleMarker>
+            ))}
+            {approximateLocations.map((marker) => (
+              <CircleMarker
+                key={`approximate-${marker.id}`}
+                center={[marker.lat, marker.lng]}
+                radius={7}
+                pathOptions={{ color: "#64748b", dashArray: "4 4", fillColor: "#94a3b8", fillOpacity: 0.28 }}
+              >
+                <Popup>
+                  <strong>{marker.marker_label}</strong><br />
+                  {marker.category} · {marker.location || "Location context unavailable"}<br />
+                  Excluded from verified cluster centroids.
+                </Popup>
+                <Tooltip direction="top" sticky>{marker.marker_label}</Tooltip>
               </CircleMarker>
             ))}
           </MapContainer>
@@ -749,7 +805,7 @@ function App() {
         <div className="staff-register-heading"><div className="bmc-register-heading-copy"><h2 id="staff-register-title">Complaint register</h2><p>Search individual reports and open their cluster details.</p></div><span className="bmc-register-result-count">{register.total} results</span></div>
         <div className="staff-register-filters"><label>Search<input type="search" value={registerFilters.q} placeholder="ID, description, category, ward or location" onChange={(event) => setRegisterFilters({ ...registerFilters, q: event.target.value })} /></label><label>Status<select value={registerFilters.status} onChange={(event) => setRegisterFilters({ ...registerFilters, status: event.target.value })}><option value="">All statuses</option><option value="open">Open</option><option value="inspection_scheduled">Inspection Scheduled</option><option value="contractor_allotted">Contractor Allotted</option><option value="in_progress">In Progress</option><option value="resolved">Resolved</option></select></label><label>Category<select value={registerFilters.category} onChange={(event) => setRegisterFilters({ ...registerFilters, category: event.target.value })}><option value="">All categories</option>{(register.categories || []).map((category) => <option key={category}>{category}</option>)}</select></label><label>Severity<select value={registerFilters.severity} onChange={(event) => setRegisterFilters({ ...registerFilters, severity: event.target.value })}><option value="">All severities</option><option>High</option><option>Medium</option><option>Low</option></select></label><button className="bmc-secondary-button" type="button" onClick={() => setRegisterFilters({ q: "", status: "", category: "", severity: "" })}>Clear filters</button><button className="bmc-secondary-button" type="button" onClick={() => loadRegister()} disabled={registerLoading}>{registerLoading ? "Refreshing…" : "Refresh"}</button></div>
         {registerError && <p className="error" role="alert">{registerError}</p>}
-        {registerLoading && !register.items.length ? <p role="status">Loading complaints…</p> : register.items.length ? <><div className="staff-register-list">{register.items.map((complaint) => { const statusOptions = [complaint.status, ...(nextStaffStatuses[complaint.status] || [])]; return <article className="staff-register-row" key={complaint.id}><button className="staff-register-open" type="button" onClick={() => openComplaint(complaint)}><b>{complaint.id}</b><span>{complaint.text}</span><small>{complaint.created_at ? new Date(complaint.created_at).toLocaleString() : ""} · {complaint.category || "Uncategorised"} · Ward {complaint.ward || "—"} · {complaint.location || "Location unavailable"}</small></button><span className={`staff-severity staff-severity-${(complaint.severity || "").toLowerCase()}`}>{complaint.severity}</span><select aria-label={`Status for ${complaint.id}`} disabled={Boolean(statusBusy[complaint.id])} value={complaint.status} onChange={(event) => updateStatus(complaint, event.target.value)}>{statusOptions.map((value) => <option value={value} key={value}>{value.replaceAll("_", " ")}</option>)}</select></article>; })}</div>{register.items.length < register.total && <button className="staff-load-more" type="button" disabled={registerLoading} onClick={() => loadRegister(registerFilters, register.items.length, true)}>{registerLoading ? "Loading…" : "Load more complaints"}</button>}</> : <p className="staff-register-empty">{registerError ? "Complaint results could not be loaded." : "No complaints match these filters."}</p>}
+        {registerLoading && !register.items.length ? <p role="status">Loading complaints…</p> : register.items.length ? <><div className="staff-register-list">{register.items.map((complaint) => { const statusOptions = [complaint.status, ...(nextStaffStatuses[complaint.status] || [])]; const confidenceNote = complaint.location_confidence === "approximate" ? " · Approximate location; excluded from clustering" : complaint.location_confidence === "unknown" ? " · Location unresolved (confidence unknown)" : ""; const canRetry = complaint.location_confidence !== "verified"; return <article className="staff-register-row" key={complaint.id}><button className="staff-register-open" type="button" onClick={() => openComplaint(complaint)}><b>{complaint.id}</b><span>{complaint.text}</span><small>{formatIndiaDateTime(complaint.created_at)} · {complaint.category || "Uncategorised"} · Ward {complaint.ward || "—"} · {complaint.location || "Location unavailable"}{confidenceNote}</small></button><span className={`staff-severity staff-severity-${(complaint.severity || "").toLowerCase()}`}>{complaint.severity}</span>{canRetry && <button className="bmc-secondary-button" type="button" disabled={Boolean(locationRetryBusy[complaint.id])} onClick={() => retryComplaintLocation(complaint)}>{locationRetryBusy[complaint.id] ? "Checking…" : "Retry location"}</button>}<select aria-label={`Status for ${complaint.id}`} disabled={Boolean(statusBusy[complaint.id])} value={complaint.status} onChange={(event) => updateStatus(complaint, event.target.value)}>{statusOptions.map((value) => <option value={value} key={value}>{value.replaceAll("_", " ")}</option>)}</select></article>; })}</div>{register.items.length < register.total && <button className="staff-load-more" type="button" disabled={registerLoading} onClick={() => loadRegister(registerFilters, register.items.length, true)}>{registerLoading ? "Loading…" : "Load more complaints"}</button>}</> : <p className="staff-register-empty">{registerError ? "Complaint results could not be loaded." : "No complaints match these filters."}</p>}
       </section>
 
       {selected && (
@@ -780,6 +836,7 @@ function App() {
                     <strong>Complaint text:</strong>{" "}
                     {report.text || "(no caption provided)"}
                   </p>
+                  <small>Category: {report.category || "Uncategorised"} · Location confidence: {report.location_confidence || "unknown"}</small>
                   {(report.has_media || report.has_video || report.has_image) && (
                     <section className="private-evidence">
                       {!evidenceByComplaint[report.id] && <button type="button" onClick={() => loadEvidence(report.id)}>{staffToken ? "View private evidence" : "Sign in to view private evidence"}</button>}
