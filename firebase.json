@@ -1,0 +1,28 @@
+{
+  "hosting": [
+    {
+      "target": "staff",
+      "public": "Mini Proj/frontend/dist",
+      "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+      "rewrites": [
+        { "source": "**", "destination": "/index.html" }
+      ]
+    },
+    {
+      "target": "citizen",
+      "public": "Mini Proj/citizen-frontend/dist",
+      "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+      "rewrites": [
+        { "source": "**", "destination": "/index.html" }
+      ]
+    },
+    {
+      "target": "social",
+      "public": "CivicSocial/frontend",
+      "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+      "rewrites": [
+        { "source": "**", "destination": "/index.html" }
+      ]
+    }
+  ]
+}

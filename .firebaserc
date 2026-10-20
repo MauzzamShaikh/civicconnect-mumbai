@@ -1,0 +1,23 @@
+{
+  "projects": {},
+  "targets": {
+    "civicconnect-d9da7": {
+      "hosting": {
+        "staff": [
+          "civicconnect-d9da7"
+        ],
+        "citizen": [
+          "civicconnect-citizen-portal"
+        ]
+      }
+    },
+    "civicsocial-2008a": {
+      "hosting": {
+        "social": [
+          "civicsocial-2008a"
+        ]
+      }
+    }
+  },
+  "etags": {}
+}

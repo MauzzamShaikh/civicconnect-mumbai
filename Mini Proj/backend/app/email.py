@@ -1,4 +1,7 @@
-"""Synchronous SMTP delivery for citizen authentication messages."""
+"""Email delivery for citizen authentication messages.
+
+Uses the Brevo HTTPS API when configured. SMTP remains available for local development.
+"""
 
 import logging
 import os
@@ -8,12 +11,14 @@ from email.message import EmailMessage
 from html import escape
 from urllib.parse import urlencode
 
+import requests
+
 
 logger = logging.getLogger(__name__)
 
 
 class EmailDeliveryError(RuntimeError):
-    """Raised when configured SMTP delivery is unavailable."""
+    """Raised when configured authentication email delivery is unavailable."""
 
     SAFE_CLASSIFICATIONS = {
         "smtp_configuration",
@@ -22,14 +27,65 @@ class EmailDeliveryError(RuntimeError):
         "smtp_rejected",
         "smtp_connection",
         "smtp_delivery",
+        "brevo_configuration",
+        "brevo_rejected",
+        "brevo_connection",
+        "brevo_delivery",
     }
 
     def __init__(self, classification: str):
         super().__init__("Authentication email delivery failed")
-        self.classification = classification if classification in self.SAFE_CLASSIFICATIONS else "smtp_delivery"
+        self.classification = (
+            classification
+            if classification in self.SAFE_CLASSIFICATIONS
+            else "smtp_delivery"
+        )
 
 
 def _send_auth_email(recipient: str, subject: str, heading: str, link: str, expiry: str) -> None:
+    brevo_key = os.getenv("BREVO_API_KEY", "").strip()
+    brevo_sender = os.getenv("BREVO_SENDER_EMAIL", "").strip()
+    brevo_sender_name = os.getenv("BREVO_SENDER_NAME", "BMC Civic Complaint Portal").strip()
+
+    # If either Brevo setting is present, require both rather than silently falling
+    # back to SMTP, which is blocked on Render's free web services.
+    if brevo_key or brevo_sender:
+        if not brevo_key or not brevo_sender:
+            logger.warning("AUTH email delivery status=failed type=brevo_configuration")
+            raise EmailDeliveryError("brevo_configuration")
+
+        html_content = (
+            "<html><body><h1>BMC Civic Complaint Portal</h1>"
+            f"<h2>{escape(heading)}</h2>"
+            f'<p><a href="{escape(link, quote=True)}">Continue</a></p>'
+            f"<p>{escape(expiry)}</p></body></html>"
+        )
+        payload = {
+            "sender": {"name": brevo_sender_name, "email": brevo_sender},
+            "to": [{"email": recipient}],
+            "subject": subject,
+            "htmlContent": html_content,
+        }
+        try:
+            response = requests.post(
+                "https://api.brevo.com/v3/smtp/email",
+                headers={
+                    "accept": "application/json",
+                    "api-key": brevo_key,
+                    "content-type": "application/json",
+                },
+                json=payload,
+                timeout=15,
+            )
+        except requests.RequestException as error:
+            logger.warning("AUTH email delivery status=failed type=brevo_connection")
+            raise EmailDeliveryError("brevo_connection") from error
+
+        if not response.ok:
+            logger.warning("AUTH email delivery status=failed type=brevo_rejected")
+            raise EmailDeliveryError("brevo_rejected")
+        return
+
     host = os.getenv("SMTP_HOST", "").strip()
     sender = os.getenv("SMTP_FROM_EMAIL", "").strip()
     if not host or not sender:
@@ -63,7 +119,6 @@ def _send_auth_email(recipient: str, subject: str, heading: str, link: str, expi
             if refused:
                 raise smtplib.SMTPRecipientsRefused(refused)
     except Exception as error:
-        # SMTP exception messages may contain server details; keep only a safe category.
         if isinstance(error, smtplib.SMTPAuthenticationError):
             classification = "smtp_authentication"
         elif isinstance(error, smtplib.SMTPRecipientsRefused):

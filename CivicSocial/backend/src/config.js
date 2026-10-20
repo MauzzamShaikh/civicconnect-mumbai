@@ -15,6 +15,11 @@ export const config = {
     pass: process.env.SMTP_PASS,
     from: process.env.SMTP_FROM || "CivicSocial <no-reply@civicsocial.local>",
   },
+  brevo: {
+    apiKey: process.env.BREVO_API_KEY,
+    senderEmail: process.env.BREVO_SENDER_EMAIL,
+    senderName: process.env.BREVO_SENDER_NAME || "CivicSocial",
+  },
   googleClientId: process.env.GOOGLE_CLIENT_ID,
   bmcApiBaseUrl: process.env.BMC_API_BASE_URL,
   bmcIntegrationSecret: process.env.BMC_INTEGRATION_SECRET,
