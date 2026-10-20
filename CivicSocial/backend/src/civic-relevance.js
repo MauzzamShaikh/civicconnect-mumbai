@@ -31,6 +31,32 @@ const CIVIC_ISSUE_PATTERNS = [
   /(?:दूषित|असुरक्षित|खराब).{0,24}(?:अन्न|खाद्य|खाना)|(?:अन्न|खाद्य|खाना).{0,24}(?:विषबाधा|दूषित|असुरक्षित)/i,
 ];
 
+// High precision fallback for clear reports that Groq can occasionally miss,
+// especially short Hindi/Marathi posts. These rules require an issue state,
+// so an ordinary mention of a signal or waste is not enough to forward.
+const CLEAR_CIVIC_FALLBACKS = [
+  {
+    category: "Transport and mobility",
+    reason: "The post explicitly reports a malfunctioning traffic signal.",
+    pattern: /(?:traffic|road|वाहतूक|ट्रैफिक|यातायात)\s*(?:signal|सिग्नल).{0,55}(?:not working|does not work|isn't working|broken|malfunction\w*|काम नहीं कर रहा|काम नहीं कर रही|काम नहीं करता|काम नहीं करती|खराब|बंद|नादुरुस्त|काम करत नाही|चालत नाही)|(?:not working|does not work|isn't working|broken|malfunction\w*|काम नहीं कर रहा|काम नहीं कर रही|काम नहीं करता|काम नहीं करती|खराब|बंद|नादुरुस्त|काम करत नाही|चालत नाही).{0,55}(?:traffic|road|वाहतूक|ट्रैफिक|यातायात)\s*(?:signal|सिग्नल)/iu,
+  },
+  {
+    category: "Solid Waste Management (SWM)",
+    reason: "The post explicitly reports garbage accumulation or an area filled with waste.",
+    pattern: /(?:garbage|trash|rubbish|waste).{0,45}(?:piled|piling|accumulat\w*|overflow\w*|filled|cover\w*|strewn|not collected|not removed)|(?:piled|accumulat\w*|overflow\w*|filled|cover\w*|strewn).{0,45}(?:garbage|trash|rubbish|waste)|(?:कचरा|कचरे|कचऱ्या|कचऱ्याने).{0,45}(?:जमा|साचला|साचलेला|भरलेला|भरलेली|भरले आहे|भरी|भरा|भरे|भर गया|भर गई|भर गए|फैला|ढेर|उचलला नाही|उचललेला नाही)|(?:जमा|साचला|साचलेला|भरलेला|भरलेली|भरले आहे|भरी|भरा|भरे|भर गया|भर गई|भर गए|फैला|ढेर).{0,45}(?:कचरा|कचरे|कचऱ्या)|(?:garbage|trash|waste).{0,45}(?:कचरा|कचरे|कचऱ्या)|(?:कचरा|कचरे|कचऱ्या).{0,45}(?:garbage|trash|waste)/iu,
+  },
+  {
+    category: "Solid Waste Management (SWM)",
+    reason: "The post explicitly reports that garbage has not been collected.",
+    pattern: /(?:garbage|trash|rubbish|waste).{0,100}(?:not collected|not been collected|not picked up|not removed|hasn't been collected|has not been collected|uncollected)|(?:not collected|not been collected|not picked up|not removed|hasn't been collected|has not been collected|uncollected).{0,100}(?:garbage|trash|rubbish|waste)/iu,
+  },
+  {
+    category: "Encroachment",
+    reason: "The post reports illegal hawkers occupying a public place.",
+    pattern: /(?:illegal|unauthori[sz]ed|unlicensed|अवैध|अनधिकृत|बेकायदेशीर).{0,60}(?:hawkers?|street vendors?|vendors?|फेरीवाले|फेरीवाला|हॉकर्स?|विक्रेते).{0,60}(?:outside|near|at|on|station|railway|metro|road|footpath|market|बाहेर|जवळ|स्थानक|स्टेशन|रस्ता|पदपथ)|(?:outside|near|at|on|station|railway|metro|road|footpath|market|बाहेर|जवळ|स्थानक|स्टेशन|रस्ता|पदपथ).{0,60}(?:illegal|unauthori[sz]ed|unlicensed|अवैध|अनधिकृत|बेकायदेशीर).{0,60}(?:hawkers?|street vendors?|vendors?|फेरीवाले|फेरीवाला|हॉकर्स?|विक्रेते)/iu,
+  },
+];
+
 export function mentionsMyBmc(text = "") {
   // CivicSocial handles consist of ASCII letters, digits, and underscores.
   return /@mybmc(?![a-z0-9_])/i.test(String(text));
@@ -39,6 +65,11 @@ export function mentionsMyBmc(text = "") {
 export function isCivicIssue(text = "") {
   const value = String(text);
   return CIVIC_ISSUE_PATTERNS.some(pattern => pattern.test(value));
+}
+
+export function inferClearCivicComplaint(text = "") {
+  const value = String(text);
+  return CLEAR_CIVIC_FALLBACKS.find(({ pattern }) => pattern.test(value)) || null;
 }
 
 export function isEligibleBmcComplaint(post) {

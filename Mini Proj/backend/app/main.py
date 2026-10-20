@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+from datetime import timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,6 +41,20 @@ SEVERITY_FILTERS = {"Low", "Medium", "High"}
 SUBMISSION_EVENT_PERSISTENCE_ATTEMPTS = 3
 
 
+def _timestamp_iso(value):
+    """Serialize all API timestamps as explicit UTC instants.
+
+    Legacy complaint.created_at values are naive but were written with
+    datetime.utcnow(), so treat those as UTC instead of letting browsers
+    interpret them as local wall time.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -61,6 +76,14 @@ async def lifespan(app):
         connection.execute(
             text("ALTER TABLE complaints ADD COLUMN IF NOT EXISTS video_data TEXT")
         )
+        connection.execute(text(
+            "DO $$ BEGIN "
+            "IF (SELECT data_type FROM information_schema.columns "
+            "WHERE table_name='complaints' AND column_name='created_at') = 'timestamp without time zone' THEN "
+            "ALTER TABLE complaints ALTER COLUMN created_at TYPE TIMESTAMPTZ "
+            "USING created_at AT TIME ZONE 'UTC'; "
+            "END IF; END $$;"
+        ))
         connection.execute(
             text("ALTER TABLE complaints ADD COLUMN IF NOT EXISTS uploaded_photo_data TEXT")
         )
@@ -127,6 +150,8 @@ async def lifespan(app):
             "END IF; END $$;"
         ))
     seed()
+    with SessionLocal() as startup_session:
+        services.reconcile_named_place_clusters(startup_session)
     yield
 
 
@@ -356,6 +381,20 @@ def _complaint_media_flags(complaint):
     }
 
 
+def _location_fields(complaint):
+    confidence = services.location_confidence(complaint.location_source)
+    coordinates_valid = services.valid_location_coordinates(complaint.lat, complaint.lng)
+    # Legacy coordinates with no recognized source are deliberately serialized
+    # as unresolved. The database values remain untouched for staff investigation.
+    expose_coordinates = confidence != "unknown" and coordinates_valid
+    return {
+        "lat": complaint.lat if expose_coordinates else None,
+        "lng": complaint.lng if expose_coordinates else None,
+        "location_source": complaint.location_source,
+        "location_confidence": confidence if expose_coordinates else "unknown",
+    }
+
+
 def public(complaint):
     media_flags = _complaint_media_flags(complaint)
     return {
@@ -364,7 +403,7 @@ def public(complaint):
         "language": complaint.language,
         "ward": complaint.ward_code,
         "location": complaint.location,
-        "category": complaint.category,
+        "category": complaint.category or services.infer_category(complaint.text),
         "cluster_id": complaint.cluster_id,
         "severity": complaint.final_severity,
         "severity_score": complaint.final_score,
@@ -374,10 +413,8 @@ def public(complaint):
         "is_real": complaint.is_real,
         "rank_in_cluster": complaint.rank_in_cluster,
         "status": ("pending_review" if complaint.review_state == "pending" else "rejected" if complaint.review_state == "rejected" else complaint.status),
-        "lat": complaint.lat,
-        "lng": complaint.lng,
-        "location_source": complaint.location_source,
-        "created_at": complaint.created_at.isoformat() if complaint.created_at else None,
+        **_location_fields(complaint),
+        "created_at": _timestamp_iso(complaint.created_at),
     }
 
 
@@ -386,16 +423,15 @@ def _citizen_complaint_summary(complaint):
     return {
         "id": complaint.id,
         "text": complaint.text,
-        "created_at": complaint.created_at.isoformat() if complaint.created_at else None,
-        "category": complaint.category,
+        "created_at": _timestamp_iso(complaint.created_at),
+        "category": complaint.category or services.infer_category(complaint.text),
         "ward": complaint.ward_code,
         "severity": complaint.final_severity,
         "severity_score": complaint.final_score,
         "status": ("pending_review" if complaint.review_state == "pending" else "rejected" if complaint.review_state == "rejected" else complaint.status),
         "rejection_reason": complaint.rejection_reason,
         "location": complaint.location,
-        "lat": complaint.lat,
-        "lng": complaint.lng,
+        **_location_fields(complaint),
         **media_flags,
     }
 
@@ -500,7 +536,7 @@ def _history_for(db: Session, complaint: Complaint):
             "from_status": None,
             "to_status": complaint.status,
             "actor_label": "Citizen" if complaint.citizen_id else "BMC Team",
-            "created_at": complaint.created_at.isoformat() if complaint.created_at else None,
+            "created_at": _timestamp_iso(complaint.created_at),
         }]
     return [{
         "id": row.id,
@@ -508,7 +544,7 @@ def _history_for(db: Session, complaint: Complaint):
         "from_status": row.from_status,
         "to_status": row.to_status,
         "actor_label": row.actor_label,
-        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "created_at": _timestamp_iso(row.created_at),
     } for row in rows]
 
 
@@ -524,7 +560,7 @@ def _notification_json(item: Notification, complaint: Complaint | None = None):
         "title": title,
         "summary": summary,
         "read": item.read_at is not None,
-        "created_at": item.created_at.isoformat() if item.created_at else None,
+        "created_at": _timestamp_iso(item.created_at),
     }
 
 
@@ -829,7 +865,7 @@ def citizen_dashboard(db: Session = Depends(get_db), current_user: User = Depend
         "followed_complaints": [_citizen_complaint_summary(row) for row in followed],
         "recent_activity": [{"complaint_id": row.complaint_id, "event_type": row.event_type,
                              "from_status": row.from_status, "to_status": row.to_status,
-                             "created_at": row.created_at.isoformat() if row.created_at else None}
+                             "created_at": _timestamp_iso(row.created_at)}
                             for row in history],
     }
 
@@ -990,6 +1026,65 @@ def get_bmc_complaint(complaint_id: str, db: Session = Depends(get_db),
     return {**public(complaint), "source": complaint.source, "history": _history_for(db, complaint)}
 
 
+@app.post("/bmc/complaints/{complaint_id}/resolve-location")
+def retry_bmc_complaint_location(complaint_id: str, db: Session = Depends(get_db),
+                                 _current_user: User = Depends(require_bmc_staff)):
+    """Retry geocoding an unresolved report; only verified results can update or cluster it."""
+    complaint = db.get(Complaint, complaint_id)
+    if not complaint:
+        raise HTTPException(404, "Complaint not found")
+    # Retry only unresolved or approximate locations. Verified pins and geocoder
+    # results remain final until a dedicated correction workflow exists.
+    was_verified = services.has_verified_location(
+        complaint.location_source, complaint.lat, complaint.lng
+    )
+    if was_verified:
+        return {**public(complaint), "location_retry": "already_verified"}
+
+    previous_cluster_id = complaint.cluster_id
+    try:
+        resolved = services.resolve_location(complaint.text)
+    except Exception as error:
+        logger.warning("LOCATION retry failed complaint_id=%s type=%s", complaint.id, type(error).__name__)
+        resolved = None
+
+    if not resolved or not services.has_verified_location(
+        resolved.get("source"), resolved.get("lat"), resolved.get("lng")
+    ):
+        return {**public(complaint), "location_retry": "unresolved"}
+
+    try:
+        complaint.lat = float(resolved["lat"])
+        complaint.lng = float(resolved["lng"])
+        complaint.location_source = resolved["source"]
+        complaint.location = str(resolved.get("display_name") or "Verified location")[:255]
+        complaint.ward_code = resolved.get("ward_code") or services.infer_ward_from_text(complaint.text)
+        complaint.cluster_id = -1
+        complaint.rank_in_cluster = None
+        db.flush()
+        if complaint.review_state == "accepted" and complaint.status in (
+            "open", "inspection_scheduled", "contractor_allotted", "in_progress",
+        ):
+            complaint.cluster_id = services.assign_cluster(
+                db,
+                complaint.embedding,
+                complaint.lat,
+                complaint.lng,
+                complaint_text=services._cluster_place_text(complaint.text, complaint.location),
+                location_label=complaint.location,
+            )
+        if previous_cluster_id != -1 and previous_cluster_id != complaint.cluster_id:
+            services.rerank(db, previous_cluster_id)
+        if complaint.cluster_id != -1:
+            services.rerank(db, complaint.cluster_id)
+        db.commit()
+    except SQLAlchemyError as error:
+        db.rollback()
+        raise HTTPException(500, "The verified location could not be saved.") from error
+    db.refresh(complaint)
+    return {**public(complaint), "location_retry": "resolved"}
+
+
 @app.get("/bmc/reviews")
 def review_queue(limit: int = Query(default=25, ge=1, le=50), offset: int = Query(default=0, ge=0),
                  db: Session = Depends(get_db), _user: User = Depends(require_bmc_staff)):
@@ -1044,7 +1139,11 @@ def accept_review(complaint_id: str, db: Session = Depends(get_db), user: User =
         complaint.review_state = "accepted"
         complaint.status = "open"
         if complaint.source == "citizen" and complaint.location_source == "citizen_pin":
-            complaint.cluster_id = services.assign_citizen_pinned_cluster(db, complaint.embedding, complaint.lat, complaint.lng)
+            complaint.cluster_id = services.assign_citizen_pinned_cluster(
+                db, complaint.embedding, complaint.lat, complaint.lng,
+                complaint_text=complaint.text,
+                location_label=complaint.location,
+            )
             pinned_match = db.scalar(select(Complaint.id).where(
                 Complaint.cluster_id == complaint.cluster_id,
                 Complaint.id != complaint.id,
@@ -1056,9 +1155,25 @@ def accept_review(complaint_id: str, db: Session = Depends(get_db), user: User =
             # matching path as other submissions instead of forcing a new ID.
             if not pinned_match:
                 complaint.cluster_id = -1
-                complaint.cluster_id = services.assign_cluster(db, complaint.embedding, complaint.lat, complaint.lng)
+                complaint.cluster_id = services.assign_cluster(
+                    db,
+                    complaint.embedding,
+                    complaint.lat,
+                    complaint.lng,
+                    complaint_text=services._cluster_place_text(complaint.text, complaint.location),
+                    location_label=complaint.location,
+                )
+        elif services.has_verified_location(complaint.location_source, complaint.lat, complaint.lng):
+            complaint.cluster_id = services.assign_cluster(
+                db,
+                complaint.embedding,
+                complaint.lat,
+                complaint.lng,
+                complaint_text=services._cluster_place_text(complaint.text, complaint.location),
+                location_label=complaint.location,
+            )
         else:
-            complaint.cluster_id = services.assign_cluster(db, complaint.embedding, complaint.lat, complaint.lng)
+            complaint.cluster_id = -1
         db.flush()
         services.rerank(db, complaint.cluster_id)
         key = f"review:{complaint.id}:accepted"
@@ -1103,8 +1218,8 @@ def citizen_track(reference: str, db: Session = Depends(get_db), _user: User = D
         raise HTTPException(404, "No complaint was found for that reference.")
     status_value = "rejected" if complaint.review_state == "rejected" else "pending_review" if complaint.review_state == "pending" else complaint.status
     events = _history_for(db, complaint)
-    return {"reference": complaint.id, "text": complaint.text, "status": status_value, "created_at": complaint.created_at.isoformat() if complaint.created_at else None,
-        "category": complaint.category, "ward": complaint.ward_code, "location": complaint.location,
+    return {"reference": complaint.id, "text": complaint.text, "status": status_value, "created_at": _timestamp_iso(complaint.created_at),
+        "category": complaint.category or services.infer_category(complaint.text), "ward": complaint.ward_code, "location": complaint.location,
         "timeline": [{"status": ("pending_review" if e["to_status"] == "pending" or e["event_type"] == "submitted" and complaint.review_state == "pending" else "rejected" if e["to_status"] == "rejected" else "open" if e["to_status"] == "accepted" else e["to_status"]), "event": e["event_type"], "created_at": e["created_at"]} for e in events]}
 
 
@@ -1249,19 +1364,29 @@ def clusters(
 ):
     results = []
     active_statuses = ("open", "inspection_scheduled", "contractor_allotted", "in_progress")
-    cluster_ids = db.execute(select(Complaint.cluster_id).where(Complaint.review_state == "accepted", Complaint.status.in_(active_statuses), Complaint.cluster_id != -1, Complaint.lat.is_not(None), Complaint.lng.is_not(None)).distinct()).all()
+    cluster_ids = db.execute(select(Complaint.cluster_id).where(Complaint.review_state == "accepted", Complaint.status.in_(active_statuses), Complaint.cluster_id != -1, Complaint.location_source.in_(services.VERIFIED_LOCATION_SOURCES), Complaint.lat.is_not(None), Complaint.lng.is_not(None), Complaint.embedding.is_not(None)).distinct()).all()
 
     for (cluster_id,) in cluster_ids:
         query = (
             select(Complaint)
-            .where(Complaint.cluster_id == cluster_id, Complaint.review_state == "accepted", Complaint.status.in_(active_statuses), Complaint.lat.is_not(None), Complaint.lng.is_not(None))
+            .where(Complaint.cluster_id == cluster_id, Complaint.review_state == "accepted", Complaint.status.in_(active_statuses), Complaint.location_source.in_(services.VERIFIED_LOCATION_SOURCES), Complaint.lat.is_not(None), Complaint.lng.is_not(None), Complaint.embedding.is_not(None))
             .order_by(Complaint.rank_in_cluster)
         )
-        items = list(db.scalars(query))
+        items = [
+            item for item in db.scalars(query)
+            if services.valid_location_coordinates(item.lat, item.lng)
+            and services.valid_embedding(item.embedding)
+        ]
         if not items:
             continue
 
-        categories = [item.category or "Uncategorised" for item in items]
+        # A citizen-selected map point is the most precise location evidence
+        # for a cluster. Do not let less precise reverse-geocoder POI results
+        # pull the visible marker away from that pin.
+        pinned_items = [item for item in items if item.location_source == "citizen_pin"]
+        centroid_items = pinned_items or items
+
+        categories = [item.category or services.infer_category(item.text) or "Uncategorised" for item in items]
         dominant = max(set(categories), key=categories.count)
         results.append(
             {
@@ -1270,8 +1395,8 @@ def clusters(
                 "dominant_category": dominant,
                 "top_ranked_complaint": public(items[0]),
                 "centroid": {
-                    "lat": sum(item.lat for item in items) / len(items),
-                    "lng": sum(item.lng for item in items) / len(items),
+                    "lat": sum(item.lat for item in centroid_items) / len(centroid_items),
+                    "lng": sum(item.lng for item in centroid_items) / len(centroid_items),
                 },
             }
         )
@@ -1288,10 +1413,14 @@ def cluster(
     active_statuses = ("open", "inspection_scheduled", "contractor_allotted", "in_progress")
     query = (
         select(Complaint)
-        .where(Complaint.cluster_id == cluster_id, Complaint.review_state == "accepted", Complaint.status.in_(active_statuses), Complaint.lat.is_not(None), Complaint.lng.is_not(None))
+        .where(Complaint.cluster_id == cluster_id, Complaint.review_state == "accepted", Complaint.status.in_(active_statuses), Complaint.location_source.in_(services.VERIFIED_LOCATION_SOURCES), Complaint.lat.is_not(None), Complaint.lng.is_not(None), Complaint.embedding.is_not(None))
         .order_by(Complaint.final_score.desc())
     )
-    items = list(db.scalars(query))
+    items = [
+        item for item in db.scalars(query)
+        if services.valid_location_coordinates(item.lat, item.lng)
+        and services.valid_embedding(item.embedding)
+    ]
     if not items:
         raise HTTPException(404, "Cluster not found")
 
@@ -1306,6 +1435,45 @@ def cluster(
         }
         for item in items
     ]
+
+
+@app.get("/map-approximations")
+def map_approximations(
+    db: Session = Depends(get_db),
+    _current_user: User = Depends(require_bmc_staff),
+):
+    """Return explicitly approximate locations for a separate staff map layer."""
+    active_statuses = ("open", "inspection_scheduled", "contractor_allotted", "in_progress")
+    rows = db.scalars(select(Complaint).where(
+        Complaint.review_state == "accepted",
+        Complaint.status.in_(active_statuses),
+        Complaint.location_source.in_(services.APPROXIMATE_LOCATION_SOURCES),
+        Complaint.lat.is_not(None),
+        Complaint.lng.is_not(None),
+    ))
+    markers = []
+    labels = {
+        "ward_approximate": "Approximate ward-centre location",
+        "geoapify_midpoint": "Approximate midpoint between reported places",
+        "nominatim_midpoint": "Approximate midpoint between reported places",
+        "photon_midpoint": "Approximate midpoint between reported places",
+    }
+    for item in rows:
+        if not services.valid_location_coordinates(item.lat, item.lng):
+            continue
+        markers.append({
+            "id": item.id,
+            "text": item.text,
+            "location": item.location,
+            "category": item.category or services.infer_category(item.text) or "Uncategorised",
+            "severity": item.final_severity,
+            "lat": item.lat,
+            "lng": item.lng,
+            "location_source": item.location_source,
+            "location_confidence": "approximate",
+            "marker_label": labels[item.location_source],
+        })
+    return markers
 
 
 @app.get("/health")

@@ -19,6 +19,8 @@ export const config = {
   bmcApiBaseUrl: process.env.BMC_API_BASE_URL,
   bmcIntegrationSecret: process.env.BMC_INTEGRATION_SECRET,
   bmcCitizenFrontendUrl: process.env.BMC_CITIZEN_FRONTEND_URL || "http://localhost:5174",
+  groqApiKey: process.env.GROQ_API_KEY,
+  groqModel: process.env.GROQ_MODEL || "openai/gpt-oss-20b",
   seedOnStartup: process.env.SEED_ON_STARTUP === "true",
 };
 

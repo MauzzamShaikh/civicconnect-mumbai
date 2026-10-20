@@ -112,7 +112,7 @@ test("the submission module is served with a JavaScript MIME type", async () => 
   const dockerfile = await readFile(resolve(frontendDir, "Dockerfile"), "utf8");
   const app = await readFile(appPath, "utf8");
   const moduleSource = await readFile(resolve(frontendDir, "post-submission.mjs"), "utf8");
-  assert.match(nginx, /location\s*=\s*\/post-submission\.mjs\s*\{[\s\S]*?default_type\s+application\/javascript\s*;/);
+  assert.match(nginx, /location\s+~\*\s+\\\.mjs\$\s*\{[\s\S]*?default_type\s+application\/javascript\s*;/);
   assert.match(dockerfile, /COPY\s+\.\s+\/usr\/share\/nginx\/html\//);
   assert.match(dockerfile, /COPY\s+nginx\.conf\s+\/etc\/nginx\/conf\.d\/default\.conf/);
   assert.match(app, /import\('\.\/post-submission\.mjs'\)/);
@@ -126,5 +126,5 @@ test("the service worker clones network responses before asynchronous cache writ
   const cacheOpenIndex = fetchHandler.indexOf("await caches.open(CACHE)");
   assert.ok(cloneIndex >= 0);
   assert.ok(cacheOpenIndex > cloneIndex);
-  assert.match(serviceWorker, /civicsocial-shell-v4/);
+  assert.match(serviceWorker, /civicsocial-shell-v5/);
 });

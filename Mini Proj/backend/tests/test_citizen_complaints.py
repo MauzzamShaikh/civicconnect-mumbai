@@ -121,13 +121,14 @@ class CitizenComplaintApiTests(unittest.TestCase):
     def _headers(user):
         return {"Authorization": f"Bearer {auth._create_access_token(user)}"}
 
-    def _saved_complaint(self, *, citizen_id, complaint_id, embedding=None, lat=19.076, lng=72.878):
+    def _saved_complaint(self, *, citizen_id, complaint_id, embedding=None, lat=19.076, lng=72.878, location_source=None):
         complaint = Complaint(
             id=complaint_id,
             citizen_id=citizen_id,
             text="Pothole near the road",
             language="en",
             location="Ward/locality from text",
+            location_source=location_source or ("nominatim" if lat is not None and lng is not None else "none"),
             cluster_id=int(complaint_id[-1]) if complaint_id[-1].isdigit() else 1,
             embedding=embedding or [1.0, 0.0],
             text_severity="Medium",
@@ -148,6 +149,20 @@ class CitizenComplaintApiTests(unittest.TestCase):
         response = self.client.post("/citizen/complaints", json={"text": "A pothole by my street"})
         self.assertEqual(response.status_code, 401)
 
+    def test_staff_submission_stores_canonical_category_without_changing_severity(self):
+        with patch.object(services, "get_infer", return_value=FakeInference()), patch.object(
+            services, "resolve_location", return_value={"lat": None, "lng": None, "display_name": None, "source": "none"}
+        ):
+            response = self.client.post(
+                "/complaints", headers=self.staff_headers,
+                json={"text": "A large pothole has formed on the road"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["category"], "Roads")
+        self.assertEqual(response.json()["severity"], "Medium")
+        self.assertEqual(self.db.get(Complaint, response.json()["id"]).category, "Roads")
+
     def test_disallowed_role_is_rejected(self):
         response = self.client.post("/citizen/complaints", headers=self.staff_headers, json={"text": "A pothole by my street"})
         self.assertEqual(response.status_code, 403)
@@ -157,6 +172,7 @@ class CitizenComplaintApiTests(unittest.TestCase):
         read_paths = (
             "/complaints",
             "/clusters",
+            "/map-approximations",
             f"/clusters/{complaint.cluster_id}",
             f"/bmc/complaints/{complaint.id}/media",
         )
@@ -285,10 +301,288 @@ class CitizenComplaintApiTests(unittest.TestCase):
         cluster_id = services.assign_cluster(self.db, [1.0, 0.0], 19.076 + delta_lat, 72.878)
         self.assertEqual(cluster_id, 1)
 
+    def test_distant_reports_do_not_merge_even_with_identical_embeddings(self):
+        self._saved_complaint(citizen_id=None, complaint_id="CMP-CLUSTER1")
+        delta_lat = 4_000 / 111_195
+
+        cluster_id = services.assign_cluster(self.db, [1.0, 0.0], 19.076 + delta_lat, 72.878)
+
+        self.assertEqual(cluster_id, 2)
+
+    def test_semantically_distinct_reports_do_not_merge_at_the_same_point(self):
+        self._saved_complaint(citizen_id=None, complaint_id="CMP-CLUSTER1", embedding=[0.0, 1.0])
+
+        cluster_id = services.assign_cluster(self.db, [1.0, 0.0], 19.076, 72.878)
+        citizen_pin_cluster_id = services.assign_citizen_pinned_cluster(self.db, [1.0, 0.0], 19.076, 72.878)
+
+        self.assertEqual(cluster_id, 2)
+        self.assertEqual(citizen_pin_cluster_id, 2)
+
+    def test_related_reports_can_merge_near_the_same_specific_location(self):
+        self._saved_complaint(citizen_id=None, complaint_id="CMP-CLUSTER1", embedding=[1.0, 0.0])
+        delta_lat = 25 / 111_195
+
+        cluster_id = services.assign_cluster(self.db, [0.6, 0.8], 19.076 + delta_lat, 72.878)
+
+        self.assertEqual(cluster_id, 1)
+
+    def test_cross_language_normalized_issue_similarity_merges_at_same_verified_location(self):
+        self._saved_complaint(citizen_id=None, complaint_id="CMP-CROSSLANG1", embedding=[1.0, 0.0])
+        similarity = 0.7665
+        orthogonal = math.sqrt(1 - similarity ** 2)
+
+        cluster_id = services.assign_cluster(
+            self.db,
+            [similarity, orthogonal],
+            19.076,
+            72.878,
+        )
+
+        self.assertEqual(cluster_id, 1)
+
+    def test_ward_approximate_coordinates_do_not_join_or_create_map_clusters(self):
+        self._saved_complaint(
+            citizen_id=None,
+            complaint_id="CMP-APPROX001",
+            location_source="ward_approximate",
+        )
+
+        cluster_id = services.assign_cluster(self.db, [1.0, 0.0], 19.076, 72.878)
+        citizen_pin_cluster_id = services.assign_citizen_pinned_cluster(self.db, [1.0, 0.0], 19.076, 72.878)
+
+        self.assertEqual(cluster_id, 2)
+        self.assertEqual(citizen_pin_cluster_id, 2)
+        self.assertEqual(self.client.get("/clusters", headers=self.staff_headers).json(), [])
+        self.assertEqual(self.client.get("/clusters/1", headers=self.staff_headers).status_code, 404)
+
+    def test_staff_location_retry_clusters_only_a_verified_geocoded_result(self):
+        complaint = self._saved_complaint(
+            citizen_id=None, complaint_id="CMP-RETRYLOC01", lat=None, lng=None,
+            location_source="none", embedding=[1.0, 0.0],
+        )
+        complaint.status = "open"
+        complaint.review_state = "accepted"
+        complaint.cluster_id = -1
+        self.db.commit()
+
+        with patch.object(services, "resolve_location", return_value={
+            "lat": 19.076, "lng": 72.878, "display_name": "Verified place, Mumbai", "source": "geoapify",
+        }):
+            response = self.client.post(
+                f"/bmc/complaints/{complaint.id}/resolve-location", headers=self.staff_headers,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["location_retry"], "resolved")
+        self.assertEqual(response.json()["location_confidence"], "verified")
+        self.assertEqual(response.json()["cluster_id"], 1)
+
+    def test_staff_location_retry_does_not_promote_midpoint_to_verified_or_clustered(self):
+        complaint = self._saved_complaint(
+            citizen_id=None, complaint_id="CMP-RETRYMID01", lat=None, lng=None,
+            location_source="none", embedding=[1.0, 0.0],
+        )
+        complaint.status = "open"
+        complaint.review_state = "accepted"
+        complaint.cluster_id = -1
+        self.db.commit()
+
+        with patch.object(services, "resolve_location", return_value={
+            "lat": 19.12, "lng": 72.90, "display_name": "Approximate midpoint", "source": "geoapify_midpoint",
+        }):
+            response = self.client.post(
+                f"/bmc/complaints/{complaint.id}/resolve-location", headers=self.staff_headers,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["location_retry"], "unresolved")
+        self.assertEqual(response.json()["cluster_id"], -1)
+        self.assertIsNone(self.db.get(Complaint, complaint.id).lat)
+        self.assertIsNone(self.db.get(Complaint, complaint.id).lng)
+
+    def test_staff_location_retry_never_overwrites_verified_user_pin(self):
+        complaint = self._saved_complaint(
+            citizen_id=None, complaint_id="CMP-RETRYPIN01", lat=19.08, lng=72.88,
+            location_source="citizen_pin", embedding=[1.0, 0.0],
+        )
+        original = (complaint.lat, complaint.lng)
+
+        with patch.object(services, "resolve_location") as resolver:
+            response = self.client.post(
+                f"/bmc/complaints/{complaint.id}/resolve-location", headers=self.staff_headers,
+            )
+
+        resolver.assert_not_called()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["location_retry"], "already_verified")
+        self.assertEqual((response.json()["lat"], response.json()["lng"]), original)
+
+    def test_staff_location_retry_does_not_recheck_verified_geocoded_locations(self):
+        for source in ("geoapify", "nominatim"):
+            with self.subTest(source=source):
+                complaint = self._saved_complaint(
+                    citizen_id=None, complaint_id=f"CMP-VERIFIED-{source}", lat=19.12, lng=72.84,
+                    location_source=source, embedding=[1.0, 0.0],
+                )
+                original = (complaint.lat, complaint.lng, complaint.location_source, complaint.cluster_id)
+
+                with patch.object(services, "resolve_location") as resolver:
+                    response = self.client.post(
+                        f"/bmc/complaints/{complaint.id}/resolve-location", headers=self.staff_headers,
+                    )
+
+                resolver.assert_not_called()
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["location_retry"], "already_verified")
+                saved = self.db.get(Complaint, complaint.id)
+                self.assertEqual((saved.lat, saved.lng, saved.location_source, saved.cluster_id), original)
+
+    def test_staff_approximation_layer_labels_ward_and_midpoint_markers_separately(self):
+        ward = self._saved_complaint(
+            citizen_id=None, complaint_id="CMP-WARDAPP01", location_source="ward_approximate",
+        )
+        midpoint = self._saved_complaint(
+            citizen_id=None, complaint_id="CMP-MIDPOINT1", location_source="geoapify_midpoint",
+        )
+        midpoint.location = "Approximate midpoint between a library and a market"
+        unknown = self._saved_complaint(
+            citizen_id=None, complaint_id="CMP-UNKNOWN01", location_source="nominatim",
+        )
+        unknown.location_source = None
+        self.db.commit()
+
+        response = self.client.get("/map-approximations", headers=self.staff_headers)
+
+        self.assertEqual(response.status_code, 200)
+        markers = {item["id"]: item for item in response.json()}
+        self.assertEqual(set(markers), {ward.id, midpoint.id})
+        self.assertEqual(markers[ward.id]["location_confidence"], "approximate")
+        self.assertIn("ward-centre", markers[ward.id]["marker_label"])
+        self.assertIn("midpoint", markers[midpoint.id]["marker_label"])
+        self.assertNotIn("centroid", markers[midpoint.id])
+        self.assertNotIn(unknown.id, markers)
+        self.assertEqual(self.client.get("/map-approximations").status_code, 401)
+        self.assertEqual(self.client.get("/map-approximations", headers=self.citizen_headers).status_code, 403)
+
+    def test_unknown_legacy_coordinates_are_returned_as_unresolved_without_data_changes(self):
+        complaint = self._saved_complaint(
+            citizen_id=None, complaint_id="CMP-LEGACYLOC1", location_source="nominatim",
+        )
+        original_coordinates = (complaint.lat, complaint.lng)
+        complaint.location_source = None
+        self.db.commit()
+
+        response = self.client.get("/complaints", headers=self.staff_headers)
+
+        self.assertEqual(response.status_code, 200)
+        row = next(item for item in response.json()["items"] if item["id"] == complaint.id)
+        self.assertEqual(row["location_confidence"], "unknown")
+        self.assertIsNone(row["lat"])
+        self.assertIsNone(row["lng"])
+        self.assertEqual((self.db.get(Complaint, complaint.id).lat, self.db.get(Complaint, complaint.id).lng), original_coordinates)
+        self.assertEqual(self.client.get("/clusters", headers=self.staff_headers).json(), [])
+        self.assertEqual(self.client.get("/clusters/1", headers=self.staff_headers).status_code, 404)
+
+    def test_midpoint_submission_keeps_coordinates_as_approximate_and_unclustered(self):
+        with patch.object(services, "get_infer", return_value=FakeInference()), patch.object(
+            services, "resolve_location", return_value={
+                "lat": 19.12, "lng": 72.90, "display_name": "Approximate midpoint between two places",
+                "source": "geoapify_midpoint",
+            },
+        ):
+            response = self.client.post(
+                "/complaints", headers=self.staff_headers,
+                json={"text": "A pothole between the library and market"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual(result["cluster_id"], -1)
+        self.assertEqual(result["location_confidence"], "approximate")
+        self.assertEqual((result["lat"], result["lng"]), (19.12, 72.90))
+        self.assertEqual(self.client.get("/clusters", headers=self.staff_headers).json(), [])
+        self.assertEqual(
+            [marker["id"] for marker in self.client.get("/map-approximations", headers=self.staff_headers).json()],
+            [result["id"]],
+        )
+
+    def test_accepting_midpoint_report_keeps_it_approximate_and_unclustered(self):
+        complaint = self._saved_complaint(
+            citizen_id=None, complaint_id="CMP-MIDPEND01", location_source="nominatim_midpoint",
+        )
+        complaint.source = "civicsocial"
+        complaint.review_state = "pending"
+        complaint.cluster_id = -1
+        self.db.commit()
+
+        response = self.client.post(
+            f"/bmc/reviews/{complaint.id}/accept", headers=self.staff_headers,
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["cluster_id"], -1)
+        self.assertEqual(response.json()["location_confidence"], "approximate")
+        self.assertEqual(self.client.get("/clusters", headers=self.staff_headers).json(), [])
+        self.assertEqual(
+            self.client.get("/map-approximations", headers=self.staff_headers).json()[0]["id"],
+            complaint.id,
+        )
+
+    def test_nonfinite_coordinates_do_not_join_or_create_map_clusters(self):
+        self._saved_complaint(
+            citizen_id=None,
+            complaint_id="CMP-NANLOC01",
+            lat=float("nan"),
+            lng=72.878,
+            location_source="nominatim",
+        )
+
+        cluster_id = services.assign_cluster(self.db, [1.0, 0.0], 19.076, 72.878)
+
+        self.assertEqual(cluster_id, 2)
+        self.assertEqual(self.client.get("/clusters", headers=self.staff_headers).json(), [])
+
     def test_unlocated_report_never_inherits_an_existing_cluster_map_pin(self):
         self._saved_complaint(citizen_id=None, complaint_id="CMP-CLUSTER1")
         cluster_id = services.assign_cluster(self.db, [1.0, 0.0], None, None)
         self.assertEqual(cluster_id, -1)
+
+    def test_invalid_coordinates_and_embeddings_never_create_cluster_membership(self):
+        self.assertEqual(services.assign_cluster(self.db, [1.0, 0.0], float("nan"), 72.878), -1)
+        self.assertEqual(services.assign_cluster(self.db, [0.0, 0.0], 19.076, 72.878), -1)
+        self.assertEqual(services.assign_cluster(self.db, [float("inf"), 1.0], 19.076, 72.878), -1)
+
+        invalid_member = self._saved_complaint(
+            citizen_id=None, complaint_id="CMP-BADVECTOR1", embedding=[0.0, 0.0],
+        )
+        invalid_member.cluster_id = 1
+        self.db.commit()
+        self.assertEqual(self.client.get("/clusters", headers=self.staff_headers).json(), [])
+        self.assertEqual(self.client.get("/clusters/1", headers=self.staff_headers).status_code, 404)
+
+    def test_related_mittal_fixture_groups_but_unrelated_school_and_vihar_fixture_stays_separate(self):
+        anchor = self._saved_complaint(citizen_id=None, complaint_id="CMP-MITTAL001")
+        anchor.text = "Poor road condition near Mittal College in Malad West"
+        anchor.location = "Mittal College, Malad West"
+        self.db.commit()
+        near_location = services.assign_cluster(self.db, [0.6, 0.8], 19.076 + 25 / 111_195, 72.878)
+        self.assertEqual(near_location, 1)
+
+        far_location = services.assign_cluster(self.db, [1.0, 0.0], 19.076 + 3_500 / 111_195, 72.878)
+        self.assertEqual(far_location, 2)
+
+    def test_fatima_and_nausena_fixture_stays_separate_despite_shared_locality(self):
+        footpath = self._saved_complaint(
+            citizen_id=None, complaint_id="CMP-FATIMA001", embedding=[1.0, 0.0],
+        )
+        footpath.text = "Footpath encroachment outside Fatima High School, Vidyavihar West"
+        garbage_text = "Garbage collection outside Nausena Vihar, Vidyavihar West"
+        self.db.commit()
+
+        self.assertIn("Nausena Vihar", garbage_text)
+        cluster_id = services.assign_cluster(self.db, [0.0, 1.0], 19.076 + 500 / 111_195, 72.878)
+
+        self.assertEqual(cluster_id, 2)
 
     def test_located_report_does_not_join_a_cluster_without_member_coordinates(self):
         self._saved_complaint(citizen_id=None, complaint_id="CMP-CLUSTER1", lat=None, lng=None)
@@ -304,6 +598,19 @@ class CitizenComplaintApiTests(unittest.TestCase):
         self.db.commit()
         self.assertEqual(self.client.get("/clusters", headers=self.staff_headers).json(), [])
         self.assertEqual(self.client.get("/clusters/1", headers=self.staff_headers).status_code, 404)
+
+    def test_legacy_missing_category_is_inferred_for_map_without_rewriting_record(self):
+        complaint = self._saved_complaint(citizen_id=None, complaint_id="CMP-CATMAP01")
+        complaint.text = "A large pothole has formed on the road"
+        complaint.category = None
+        self.db.commit()
+
+        response = self.client.get("/clusters", headers=self.staff_headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()[0]["dominant_category"], "Roads")
+        self.assertEqual(response.json()[0]["top_ranked_complaint"]["category"], "Roads")
+        self.assertIsNone(self.db.get(Complaint, complaint.id).category)
 
     def test_list_and_media_are_owner_scoped_and_lists_omit_payloads(self):
         complaint = self._saved_complaint(citizen_id=self.citizen.id, complaint_id="CMP-MEDIA001")
@@ -472,7 +779,7 @@ class CitizenComplaintApiTests(unittest.TestCase):
         video = "data:video/mp4;base64," + base64.b64encode(b"\x00\x00\x00\x10ftypmp42\x00\x00\x00\x00original-video").decode()
         inference = FakeInference()
         with patch.object(services, "get_infer", return_value=inference), patch.object(
-            services, "resolve_location", return_value={"lat": None, "lng": None, "display_name": None, "source": "none"}
+            services, "resolve_location", return_value={"lat": 19.076, "lng": 72.878, "display_name": "Mumbai", "source": "nominatim"}
         ):
             response = self.client.post(
                 "/complaints", headers=self.staff_headers,

@@ -71,8 +71,8 @@ export function localizedSeverity(language, severity) {
 
 export function formatDate(value, language) {
   if (!value) return translate(language, "Date unavailable");
-  try { return new Intl.DateTimeFormat(language === "mr" ? "mr-IN" : language === "hi" ? "hi-IN" : "en-IN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)); }
-  catch { return new Date(value).toLocaleString(); }
+  try { return new Intl.DateTimeFormat(language === "mr" ? "mr-IN" : language === "hi" ? "hi-IN" : "en-IN", { dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Kolkata" }).format(new Date(value)); }
+  catch { return new Date(value).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }); }
 }
 
 export function localizeApiError(language, message = "") {
